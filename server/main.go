@@ -818,17 +818,6 @@ func importTelegramFile(c *gin.Context) {
 		return
 	}
 
-	// Resolve file_id to download URL
-	downloadURL, err := telegramGetFileURL(tf.FileID)
-	if err != nil {
-		c.JSON(400, gin.H{
-			"error":   "File too large for standard Telegram Bot API (>20MB). Use direct URL upload instead.",
-			"fileId":  tf.FileID,
-			"details": err.Error(),
-		})
-		return
-	}
-
 	title := req.Title
 	if title == "" {
 		title = strings.TrimSuffix(tf.FileName, ".mp4")
@@ -844,18 +833,27 @@ func importTelegramFile(c *gin.Context) {
 		category = "Uncategorized"
 	}
 
-	// For local API: run async with progress tracking
+	// For local API: run fully async (including getFile which may take long for large files)
 	if isLocalTelegramAPI() {
 		taskID := uuid.New().String()
 		prog := &TransferProgress{
 			TaskID:     taskID,
-			Phase:      "starting",
+			Phase:      "resolving",
 			TotalBytes: tf.FileSize,
 			StartedAt:  time.Now(),
 		}
 		setProgress(taskID, prog)
 
 		go func() {
+			// Resolve file_id to download URL (may take time for large files)
+			downloadURL, err := telegramGetFileURL(tf.FileID)
+			if err != nil {
+				prog.Phase = "error"
+				prog.Error = "failed to resolve file: " + err.Error()
+				setProgress(taskID, prog)
+				return
+			}
+
 			bunnyVideoID, err := bunnyCreateVideo(title)
 			if err != nil {
 				prog.Phase = "error"
@@ -902,6 +900,16 @@ func importTelegramFile(c *gin.Context) {
 	}
 
 	// Non-local: synchronous upload
+	downloadURL, err := telegramGetFileURL(tf.FileID)
+	if err != nil {
+		c.JSON(400, gin.H{
+			"error":   "File too large for standard Telegram Bot API (>20MB). Use direct URL upload instead.",
+			"fileId":  tf.FileID,
+			"details": err.Error(),
+		})
+		return
+	}
+
 	bunnyVideoID, err := bunnyCreateVideo(title)
 	if err != nil {
 		c.JSON(500, gin.H{"error": "failed to create video in bunny: " + err.Error()})

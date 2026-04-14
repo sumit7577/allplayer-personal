@@ -530,7 +530,7 @@ function TelegramFileCard({ file, importing, progress, form, onFormChange, onImp
 
 function TransferProgressUI({ progress }) {
   const phase = progress.phase
-  const isDownloading = phase === 'downloading' || phase === 'starting'
+  const isDownloading = phase === 'downloading' || phase === 'starting' || phase === 'resolving'
   const isUploading = phase === 'uploading'
 
   return (
@@ -541,7 +541,7 @@ function TransferProgressUI({ progress }) {
           <div className="flex items-center gap-1.5">
             <Download className={`w-3.5 h-3.5 ${isDownloading ? 'text-blue-400' : phase === 'uploading' || phase === 'done' ? 'text-green-400' : 'text-gray-500'}`} />
             <span className="text-xs font-medium text-gray-300">
-              {isDownloading ? 'Downloading from Telegram...' : 'Downloaded'}
+              {phase === 'resolving' ? 'Resolving file from Telegram...' : isDownloading ? 'Downloading from Telegram...' : 'Downloaded'}
             </span>
           </div>
           <div className="flex items-center gap-2">
