@@ -1,0 +1,79 @@
+@import "tailwindcss";
+
+@theme {
+  --color-primary: #e50914;
+  --color-primary-hover: #f40612;
+  --color-surface: #141414;
+  --color-surface-hover: #1a1a2e;
+  --color-card: #1c1c1c;
+  --color-card-hover: #2a2a2a;
+  --color-accent: #00a8e1;
+  --color-gold: #f5c518;
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #333 transparent;
+}
+
+body {
+  font-family: 'Helvetica Neue', Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  margin: 0;
+}
+
+.hide-scrollbar::-webkit-scrollbar { display: none; }
+.hide-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+
+.player-gradient-bottom { background: linear-gradient(transparent, rgba(0,0,0,0.9)); }
+.player-gradient-top { background: linear-gradient(rgba(0,0,0,0.7), transparent); }
+
+.hero-gradient {
+  background: linear-gradient(to right, rgba(10,10,10,0.95) 0%, rgba(10,10,10,0.7) 40%, transparent 100%);
+}
+.hero-gradient-bottom {
+  background: linear-gradient(transparent 0%, #0a0a0a 100%);
+}
+
+.video-card {
+  transition: transform 0.3s ease, box-shadow 0.3s ease;
+}
+.video-card:hover {
+  transform: scale(1.05);
+  box-shadow: 0 8px 40px rgba(0,0,0,0.6);
+  z-index: 10;
+}
+
+@keyframes shimmer {
+  0% { background-position: -200px 0; }
+  100% { background-position: calc(200px + 100%) 0; }
+}
+.shimmer {
+  background: linear-gradient(90deg, #1c1c1c 0px, #2a2a2a 40px, #1c1c1c 80px);
+  background-size: 200px 100%;
+  animation: shimmer 1.5s infinite;
+}
+
+input[type="range"].player-seek {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 4px;
+  background: rgba(255,255,255,0.2);
+  border-radius: 2px;
+  outline: none;
+  transition: height 0.15s;
+}
+input[type="range"].player-seek:hover { height: 6px; }
+input[type="range"].player-seek::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #e50914;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+input[type="range"].player-seek:hover::-webkit-slider-thumb { opacity: 1; }
