@@ -23,6 +23,14 @@ import (
 var db *sql.DB
 var serverStartTime = time.Now()
 
+// telegramAPIURL returns the base URL for Telegram Bot API — local server or official
+func telegramAPIURL() string {
+	if u := os.Getenv("TELEGRAM_API_URL"); u != "" {
+		return strings.TrimRight(u, "/")
+	}
+	return "https://api.telegram.org"
+}
+
 // ---------- Models ----------
 
 type Video struct {
@@ -71,7 +79,73 @@ type ImportTelegramFileRequest struct {
 	Category    string `json:"category"`
 }
 
-// ---------- Database ----------
+// ---------- Transfer Progress ----------
+
+type TransferProgress struct {
+	TaskID          string    `json:"taskId"`
+	Phase           string    `json:"phase"` // downloading, uploading, done, error
+	TotalBytes      int64     `json:"totalBytes"`
+	DownloadedBytes int64     `json:"downloadedBytes"`
+	UploadedBytes   int64     `json:"uploadedBytes"`
+	DownloadSpeed   float64   `json:"downloadSpeed"` // bytes/sec
+	UploadSpeed     float64   `json:"uploadSpeed"`   // bytes/sec
+	DownloadPct     float64   `json:"downloadPct"`
+	UploadPct       float64   `json:"uploadPct"`
+	Error           string    `json:"error,omitempty"`
+	VideoID         string    `json:"videoId,omitempty"`
+	StartedAt       time.Time `json:"-"`
+	PhaseStartedAt  time.Time `json:"-"`
+}
+
+var (
+	progressMap = make(map[string]*TransferProgress)
+	progressMu  sync.RWMutex
+)
+
+func setProgress(taskID string, p *TransferProgress) {
+	progressMu.Lock()
+	progressMap[taskID] = p
+	progressMu.Unlock()
+}
+
+func getProgress(taskID string) *TransferProgress {
+	progressMu.RLock()
+	defer progressMu.RUnlock()
+	if p, ok := progressMap[taskID]; ok {
+		cp := *p
+		return &cp
+	}
+	return nil
+}
+
+func deleteProgress(taskID string) {
+	progressMu.Lock()
+	delete(progressMap, taskID)
+	progressMu.Unlock()
+}
+
+// progressReader wraps an io.Reader to track bytes read
+type progressReader struct {
+	reader    io.Reader
+	total     int64
+	read      int64
+	startTime time.Time
+	onUpdate  func(read int64, speed float64)
+}
+
+func (pr *progressReader) Read(p []byte) (int, error) {
+	n, err := pr.reader.Read(p)
+	pr.read += int64(n)
+	elapsed := time.Since(pr.startTime).Seconds()
+	speed := float64(0)
+	if elapsed > 0 {
+		speed = float64(pr.read) / elapsed
+	}
+	if pr.onUpdate != nil {
+		pr.onUpdate(pr.read, speed)
+	}
+	return n, err
+}
 
 func initDB() {
 	dbPath := os.Getenv("DB_PATH")
@@ -178,6 +252,127 @@ func bunnyUploadByURL(bunnyVideoID, sourceURL string) error {
 		return fmt.Errorf("bunny upload-by-url failed: %d - %s", resp.StatusCode, string(body))
 	}
 	return nil
+}
+
+// bunnyUploadDirect downloads from sourceURL and streams directly to Bunny's PUT endpoint
+func bunnyUploadDirect(bunnyVideoID, sourceURL string, taskID string, totalSize int64) error {
+	libraryID := os.Getenv("BUNNY_LIBRARY_ID")
+	apiKey := os.Getenv("BUNNY_API_KEY")
+
+	prog := getProgress(taskID)
+	if prog != nil {
+		prog.Phase = "downloading"
+		prog.PhaseStartedAt = time.Now()
+		setProgress(taskID, prog)
+	}
+
+	// Download file from local Telegram Bot API server
+	dlResp, err := http.Get(sourceURL)
+	if err != nil {
+		return fmt.Errorf("failed to download from telegram: %w", err)
+	}
+	defer dlResp.Body.Close()
+
+	if dlResp.StatusCode != 200 {
+		body, _ := io.ReadAll(dlResp.Body)
+		return fmt.Errorf("telegram download failed: %d - %s", dlResp.StatusCode, string(body))
+	}
+
+	// Use Content-Length from response if we don't have total size
+	if totalSize == 0 && dlResp.ContentLength > 0 {
+		totalSize = dlResp.ContentLength
+	}
+	if prog != nil {
+		prog.TotalBytes = totalSize
+		setProgress(taskID, prog)
+	}
+
+	// Download to temp file with progress tracking
+	tmpFile, err := os.CreateTemp("", "allplayer-upload-*")
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %w", err)
+	}
+	defer os.Remove(tmpFile.Name())
+	defer tmpFile.Close()
+
+	dlReader := &progressReader{
+		reader:    dlResp.Body,
+		total:     totalSize,
+		startTime: time.Now(),
+		onUpdate: func(read int64, speed float64) {
+			if prog != nil {
+				prog.DownloadedBytes = read
+				prog.DownloadSpeed = speed
+				if totalSize > 0 {
+					prog.DownloadPct = float64(read) / float64(totalSize) * 100
+				}
+				setProgress(taskID, prog)
+			}
+		},
+	}
+
+	downloadedSize, err := io.Copy(tmpFile, dlReader)
+	if err != nil {
+		return fmt.Errorf("download failed: %w", err)
+	}
+
+	// Update total to actual downloaded size
+	if prog != nil {
+		prog.DownloadedBytes = downloadedSize
+		prog.DownloadPct = 100
+		prog.TotalBytes = downloadedSize
+		prog.Phase = "uploading"
+		prog.PhaseStartedAt = time.Now()
+		setProgress(taskID, prog)
+	}
+
+	// Seek back to start for upload
+	tmpFile.Seek(0, 0)
+
+	// Upload to Bunny with progress tracking
+	ulReader := &progressReader{
+		reader:    tmpFile,
+		total:     downloadedSize,
+		startTime: time.Now(),
+		onUpdate: func(read int64, speed float64) {
+			if prog != nil {
+				prog.UploadedBytes = read
+				prog.UploadSpeed = speed
+				if downloadedSize > 0 {
+					prog.UploadPct = float64(read) / float64(downloadedSize) * 100
+				}
+				setProgress(taskID, prog)
+			}
+		},
+	}
+
+	req, err := http.NewRequest("PUT",
+		fmt.Sprintf("https://video.bunnycdn.com/library/%s/videos/%s", libraryID, bunnyVideoID),
+		ulReader)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("AccessKey", apiKey)
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.ContentLength = downloadedSize
+
+	resp, err := (&http.Client{Timeout: 0}).Do(req)
+	if err != nil {
+		return fmt.Errorf("bunny upload failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("bunny upload failed: %d - %s", resp.StatusCode, string(body))
+	}
+	return nil
+}
+
+// isLocalTelegramAPI returns true if using a local Bot API server
+func isLocalTelegramAPI() bool {
+	u := os.Getenv("TELEGRAM_API_URL")
+	return u != "" && !strings.Contains(u, "api.telegram.org")
 }
 
 func bunnyGetVideo(bunnyVideoID string) (map[string]interface{}, error) {
@@ -356,7 +551,7 @@ func telegramGetFileURL(fileID string) (string, error) {
 		return fileID, nil
 	}
 
-	resp, err := http.Get(fmt.Sprintf("https://api.telegram.org/bot%s/getFile?file_id=%s", botToken, fileID))
+	resp, err := http.Get(fmt.Sprintf("%s/bot%s/getFile?file_id=%s", telegramAPIURL(), botToken, fileID))
 	if err != nil {
 		return "", err
 	}
@@ -382,7 +577,7 @@ func telegramGetFileURL(fileID string) (string, error) {
 		return "", fmt.Errorf("failed to get file_path — file may be too large for Bot API (>20MB). Use direct URL instead")
 	}
 
-	return fmt.Sprintf("https://api.telegram.org/file/bot%s/%s", botToken, filePath), nil
+	return fmt.Sprintf("%s/file/bot%s/%s", telegramAPIURL(), botToken, filePath), nil
 }
 
 // startTelegramPolling runs in background, listening for forwarded videos/documents
@@ -394,7 +589,7 @@ func startTelegramPolling() {
 	}
 
 	// Verify bot token
-	resp, err := http.Get(fmt.Sprintf("https://api.telegram.org/bot%s/getMe", botToken))
+	resp, err := http.Get(fmt.Sprintf("%s/bot%s/getMe", telegramAPIURL(), botToken))
 	if err != nil {
 		log.Printf("⚠️  Failed to verify Telegram bot: %v", err)
 		return
@@ -425,7 +620,7 @@ func pollTelegramUpdates(botToken string) {
 	offset := lastUpdateID + 1
 	updateMu.Unlock()
 
-	url := fmt.Sprintf("https://api.telegram.org/bot%s/getUpdates?offset=%d&timeout=30&allowed_updates=[\"message\"]", botToken, offset)
+	url := fmt.Sprintf("%s/bot%s/getUpdates?offset=%d&timeout=30&allowed_updates=[\"message\"]", telegramAPIURL(), botToken, offset)
 	resp, err := http.Get(url)
 	if err != nil {
 		return
@@ -559,7 +754,7 @@ func pollTelegramUpdates(botToken string) {
 func sendTelegramMessage(chatID int64, text string) {
 	botToken := os.Getenv("TELEGRAM_BOT_TOKEN")
 	payload := fmt.Sprintf(`{"chat_id":%d,"text":"%s","parse_mode":"Markdown"}`, chatID, strings.ReplaceAll(text, `"`, `\"`))
-	req, _ := http.NewRequest("POST", fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", botToken), strings.NewReader(payload))
+	req, _ := http.NewRequest("POST", fmt.Sprintf("%s/bot%s/sendMessage", telegramAPIURL(), botToken), strings.NewReader(payload))
 	req.Header.Set("Content-Type", "application/json")
 	http.DefaultClient.Do(req)
 }
@@ -622,7 +817,6 @@ func importTelegramFile(c *gin.Context) {
 	// Resolve file_id to download URL
 	downloadURL, err := telegramGetFileURL(tf.FileID)
 	if err != nil {
-		// For large files, the standard Bot API can't provide a download URL
 		c.JSON(400, gin.H{
 			"error":   "File too large for standard Telegram Bot API (>20MB). Use direct URL upload instead.",
 			"fileId":  tf.FileID,
@@ -646,6 +840,64 @@ func importTelegramFile(c *gin.Context) {
 		category = "Uncategorized"
 	}
 
+	// For local API: run async with progress tracking
+	if isLocalTelegramAPI() {
+		taskID := uuid.New().String()
+		prog := &TransferProgress{
+			TaskID:     taskID,
+			Phase:      "starting",
+			TotalBytes: tf.FileSize,
+			StartedAt:  time.Now(),
+		}
+		setProgress(taskID, prog)
+
+		go func() {
+			bunnyVideoID, err := bunnyCreateVideo(title)
+			if err != nil {
+				prog.Phase = "error"
+				prog.Error = "failed to create video in bunny: " + err.Error()
+				setProgress(taskID, prog)
+				return
+			}
+
+			if err := bunnyUploadDirect(bunnyVideoID, downloadURL, taskID, tf.FileSize); err != nil {
+				prog.Phase = "error"
+				prog.Error = "failed to upload to bunny: " + err.Error()
+				setProgress(taskID, prog)
+				return
+			}
+
+			cdnHost := os.Getenv("BUNNY_CDN_HOSTNAME")
+			now := time.Now().UTC().Format(time.RFC3339)
+			videoID := uuid.New().String()
+
+			hlsURL := fmt.Sprintf("https://%s/%s/playlist.m3u8", cdnHost, bunnyVideoID)
+			thumbnailURL := fmt.Sprintf("https://%s/%s/thumbnail.jpg", cdnHost, bunnyVideoID)
+
+			db.Exec(
+				"INSERT INTO videos (id, title, description, thumbnail_url, hls_url, bunny_video_id, status, category, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+				videoID, title, req.Description, thumbnailURL, hlsURL, bunnyVideoID, "processing", category, now, now,
+			)
+
+			db.Exec("UPDATE telegram_files SET status = 'imported' WHERE id = ?", id)
+
+			prog.Phase = "done"
+			prog.UploadPct = 100
+			prog.DownloadPct = 100
+			prog.VideoID = videoID
+			setProgress(taskID, prog)
+
+			log.Printf("✅ Import complete: %s → %s", title, videoID)
+
+			// Clean up progress after 5 minutes
+			time.AfterFunc(5*time.Minute, func() { deleteProgress(taskID) })
+		}()
+
+		c.JSON(202, gin.H{"taskId": taskID, "message": "Import started"})
+		return
+	}
+
+	// Non-local: synchronous upload
 	bunnyVideoID, err := bunnyCreateVideo(title)
 	if err != nil {
 		c.JSON(500, gin.H{"error": "failed to create video in bunny: " + err.Error()})
@@ -669,7 +921,6 @@ func importTelegramFile(c *gin.Context) {
 		videoID, title, req.Description, thumbnailURL, hlsURL, bunnyVideoID, "processing", category, now, now,
 	)
 
-	// Mark telegram file as imported
 	db.Exec("UPDATE telegram_files SET status = 'imported' WHERE id = ?", id)
 
 	c.JSON(201, Video{
@@ -678,6 +929,47 @@ func importTelegramFile(c *gin.Context) {
 		BunnyVideoID: bunnyVideoID, Status: "processing",
 		Category: category, CreatedAt: now, UpdatedAt: now,
 	})
+}
+
+// GET /api/transfer/progress/:taskId — SSE endpoint for real-time progress
+func getTransferProgress(c *gin.Context) {
+	taskID := c.Param("taskId")
+
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
+
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		c.JSON(500, gin.H{"error": "streaming not supported"})
+		return
+	}
+
+	ctx := c.Request.Context()
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			prog := getProgress(taskID)
+			if prog == nil {
+				fmt.Fprintf(c.Writer, "data: {\"phase\":\"not_found\"}\n\n")
+				flusher.Flush()
+				return
+			}
+			data, _ := json.Marshal(prog)
+			fmt.Fprintf(c.Writer, "data: %s\n\n", data)
+			flusher.Flush()
+
+			if prog.Phase == "done" || prog.Phase == "error" {
+				return
+			}
+		}
+	}
 }
 
 func deleteTelegramFile(c *gin.Context) {
@@ -693,7 +985,7 @@ func getTelegramBotInfo(c *gin.Context) {
 		return
 	}
 
-	resp, err := http.Get(fmt.Sprintf("https://api.telegram.org/bot%s/getMe", botToken))
+	resp, err := http.Get(fmt.Sprintf("%s/bot%s/getMe", telegramAPIURL(), botToken))
 	if err != nil {
 		c.JSON(200, gin.H{"connected": false, "message": "Failed to connect to Telegram"})
 		return
@@ -1031,6 +1323,7 @@ func main() {
 		api.GET("/telegram/stats", getTelegramStats)
 		api.POST("/telegram/files/:id/import", importTelegramFile)
 		api.DELETE("/telegram/files/:id", deleteTelegramFile)
+		api.GET("/transfer/progress/:taskId", getTransferProgress)
 	}
 
 	// Start Telegram bot polling in background

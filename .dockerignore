@@ -1,0 +1,7 @@
+node_modules
+dist
+.git
+*.md
+server/allplayer-server
+server/allplayer.db
+server/.env

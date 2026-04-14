@@ -21,6 +21,7 @@ export const telegramAPI = {
   getStats: () => api.get('/telegram/stats'),
   importFile: (id, data) => api.post(`/telegram/files/${id}/import`, data),
   deleteFile: (id) => api.delete(`/telegram/files/${id}`),
+  getTransferProgress: (taskId) => `/api/transfer/progress/${taskId}`,
 }
 
 export default api

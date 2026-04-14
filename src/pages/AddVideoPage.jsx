@@ -27,6 +27,7 @@ export default function AddVideoPage() {
   const [tgLoading, setTgLoading] = useState(true)
   const [importing, setImporting] = useState(null)
   const [importForm, setImportForm] = useState({})
+  const [transferProgress, setTransferProgress] = useState(null)
 
   // Load bot info and files
   const loadTelegramData = useCallback(async () => {
@@ -88,20 +89,63 @@ export default function AddVideoPage() {
     setImporting(file.id)
     setError('')
     setResult(null)
+    setTransferProgress(null)
     const meta = importForm[file.id] || {}
     try {
-      const { data } = await telegramAPI.importFile(file.id, {
+      const { data, status } = await telegramAPI.importFile(file.id, {
         title: meta.title || file.fileName || 'Untitled',
         description: meta.description || file.caption || '',
         category: meta.category || '',
       })
+
+      // Async import with progress (202)
+      if (status === 202 && data.taskId) {
+        const sseUrl = telegramAPI.getTransferProgress(data.taskId)
+        const eventSource = new EventSource(sseUrl)
+
+        eventSource.onmessage = (event) => {
+          try {
+            const prog = JSON.parse(event.data)
+            setTransferProgress(prog)
+
+            if (prog.phase === 'done') {
+              eventSource.close()
+              setImporting(null)
+              setTransferProgress(null)
+              setResult({ id: prog.videoId })
+              setTgFiles(prev => prev.filter(f => f.id !== file.id))
+              setImportForm(prev => { const n = { ...prev }; delete n[file.id]; return n })
+            } else if (prog.phase === 'error') {
+              eventSource.close()
+              setImporting(null)
+              setTransferProgress(null)
+              setError(prog.error || 'Transfer failed')
+            } else if (prog.phase === 'not_found') {
+              eventSource.close()
+              setImporting(null)
+              setTransferProgress(null)
+              setError('Transfer task not found')
+            }
+          } catch {}
+        }
+
+        eventSource.onerror = () => {
+          eventSource.close()
+          setImporting(null)
+          setTransferProgress(null)
+          setError('Lost connection to transfer progress')
+        }
+        return
+      }
+
+      // Synchronous import (201)
       setResult(data)
       setTgFiles(prev => prev.filter(f => f.id !== file.id))
       setImportForm(prev => { const n = { ...prev }; delete n[file.id]; return n })
     } catch (err) {
       setError(err.response?.data?.error || err.message)
     } finally {
-      setImporting(null)
+      if (!transferProgress) setImporting(null)
     }
   }
 
@@ -293,6 +337,7 @@ export default function AddVideoPage() {
                       key={file.id}
                       file={file}
                       importing={importing === file.id}
+                      progress={importing === file.id ? transferProgress : null}
                       form={importForm[file.id] || {}}
                       onFormChange={(data) => setImportForm(prev => ({ ...prev, [file.id]: { ...(prev[file.id] || {}), ...data } }))}
                       onImport={() => handleImport(file)}
@@ -377,7 +422,7 @@ export default function AddVideoPage() {
 
 // ---------- Telegram File Card Component ----------
 
-function TelegramFileCard({ file, importing, form, onFormChange, onImport, onDelete }) {
+function TelegramFileCard({ file, importing, progress, form, onFormChange, onImport, onDelete }) {
   const [expanded, setExpanded] = useState(false)
 
   return (
@@ -408,24 +453,44 @@ function TelegramFileCard({ file, importing, form, onFormChange, onImport, onDel
           )}
         </div>
         <div className="flex items-center gap-1 shrink-0">
-          <button
-            onClick={() => setExpanded(!expanded)}
-            className="px-3 py-1.5 bg-primary text-white text-xs font-semibold rounded-md hover:bg-primary-hover transition-colors"
-          >
-            {expanded ? 'Close' : 'Import'}
-          </button>
-          <button
-            onClick={onDelete}
-            className="p-1.5 text-gray-500 hover:text-red-400 transition-colors"
-            title="Dismiss"
-          >
-            <Trash2 className="w-3.5 h-3.5" />
-          </button>
+          {!importing && (
+            <button
+              onClick={() => setExpanded(!expanded)}
+              className="px-3 py-1.5 bg-primary text-white text-xs font-semibold rounded-md hover:bg-primary-hover transition-colors"
+            >
+              {expanded ? 'Close' : 'Import'}
+            </button>
+          )}
+          {!importing && (
+            <button
+              onClick={onDelete}
+              className="p-1.5 text-gray-500 hover:text-red-400 transition-colors"
+              title="Dismiss"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+            </button>
+          )}
         </div>
       </div>
 
+      {/* Progress display */}
+      {importing && progress && (
+        <div className="px-4 pb-4 pt-1 border-t border-gray-800/50 space-y-3">
+          <TransferProgressUI progress={progress} totalSize={file.fileSize} />
+        </div>
+      )}
+
+      {/* Importing without progress (sync mode) */}
+      {importing && !progress && (
+        <div className="px-4 pb-4 pt-2 border-t border-gray-800/50">
+          <div className="flex items-center gap-2 text-sm text-gray-400">
+            <Loader2 className="w-4 h-4 animate-spin text-primary" /> Importing to Bunny Stream...
+          </div>
+        </div>
+      )}
+
       {/* Expanded import form */}
-      {expanded && (
+      {expanded && !importing && (
         <div className="px-4 pb-4 pt-2 border-t border-gray-800/50 space-y-3">
           <input
             type="text"
@@ -448,28 +513,105 @@ function TelegramFileCard({ file, importing, form, onFormChange, onImport, onDel
             rows={2}
             className="w-full bg-[#0a0a0a] border border-gray-800 rounded-lg px-3 py-2 text-white text-sm placeholder-gray-600 focus:outline-none focus:border-primary/40 transition-colors resize-none"
           />
-          {file.fileSize > 20 * 1024 * 1024 && (
-            <div className="flex items-start gap-2 p-3 bg-yellow-500/5 border border-yellow-500/20 rounded-lg">
-              <AlertCircle className="w-4 h-4 text-yellow-400 shrink-0 mt-0.5" />
-              <p className="text-xs text-yellow-400">
-                This file is {formatBytes(file.fileSize)} — larger than Telegram Bot API's 20MB download limit. 
-                Import may fail. For large files, download locally first and use a direct URL.
-              </p>
-            </div>
-          )}
           <button
             onClick={onImport}
             disabled={importing}
             className="w-full flex items-center justify-center gap-2 py-2.5 bg-primary text-white text-sm font-semibold rounded-lg hover:bg-primary-hover disabled:opacity-50 transition-all"
           >
-            {importing ? (
-              <><Loader2 className="w-4 h-4 animate-spin" /> Importing to Bunny Stream...</>
-            ) : (
-              <><Upload className="w-4 h-4" /> Upload to Bunny Stream</>
-            )}
+            <Upload className="w-4 h-4" /> Upload to Bunny Stream
           </button>
         </div>
       )}
+    </div>
+  )
+}
+
+// ---------- Transfer Progress Component ----------
+
+function TransferProgressUI({ progress }) {
+  const phase = progress.phase
+  const isDownloading = phase === 'downloading' || phase === 'starting'
+  const isUploading = phase === 'uploading'
+
+  return (
+    <div className="space-y-3">
+      {/* Download progress */}
+      <div>
+        <div className="flex items-center justify-between mb-1.5">
+          <div className="flex items-center gap-1.5">
+            <Download className={`w-3.5 h-3.5 ${isDownloading ? 'text-blue-400' : phase === 'uploading' || phase === 'done' ? 'text-green-400' : 'text-gray-500'}`} />
+            <span className="text-xs font-medium text-gray-300">
+              {isDownloading ? 'Downloading from Telegram...' : 'Downloaded'}
+            </span>
+          </div>
+          <div className="flex items-center gap-2">
+            {isDownloading && progress.downloadSpeed > 0 && (
+              <span className="text-[11px] text-blue-400 font-mono">
+                {formatSpeed(progress.downloadSpeed)}
+              </span>
+            )}
+            <span className="text-[11px] text-gray-500 font-mono">
+              {formatBytes(progress.downloadedBytes)}{progress.totalBytes > 0 ? ` / ${formatBytes(progress.totalBytes)}` : ''}
+            </span>
+          </div>
+        </div>
+        <div className="h-1.5 bg-gray-800 rounded-full overflow-hidden">
+          <div
+            className={`h-full rounded-full transition-all duration-300 ${
+              isDownloading ? 'bg-blue-500' : 'bg-green-500'
+            }`}
+            style={{ width: `${Math.min(progress.downloadPct || 0, 100)}%` }}
+          />
+        </div>
+        {isDownloading && progress.downloadPct > 0 && (
+          <p className="text-[10px] text-gray-600 mt-0.5 text-right">
+            {progress.downloadPct.toFixed(1)}%
+            {progress.downloadSpeed > 0 && progress.totalBytes > progress.downloadedBytes && (
+              <> · ETA {formatETA((progress.totalBytes - progress.downloadedBytes) / progress.downloadSpeed)}</>
+            )}
+          </p>
+        )}
+      </div>
+
+      {/* Upload progress */}
+      <div>
+        <div className="flex items-center justify-between mb-1.5">
+          <div className="flex items-center gap-1.5">
+            <Upload className={`w-3.5 h-3.5 ${isUploading ? 'text-purple-400' : phase === 'done' ? 'text-green-400' : 'text-gray-600'}`} />
+            <span className="text-xs font-medium text-gray-300">
+              {isUploading ? 'Uploading to Bunny Stream...' : phase === 'done' ? 'Uploaded' : 'Waiting...'}
+            </span>
+          </div>
+          <div className="flex items-center gap-2">
+            {isUploading && progress.uploadSpeed > 0 && (
+              <span className="text-[11px] text-purple-400 font-mono">
+                {formatSpeed(progress.uploadSpeed)}
+              </span>
+            )}
+            {(isUploading || phase === 'done') && (
+              <span className="text-[11px] text-gray-500 font-mono">
+                {formatBytes(progress.uploadedBytes)}{progress.totalBytes > 0 ? ` / ${formatBytes(progress.totalBytes)}` : ''}
+              </span>
+            )}
+          </div>
+        </div>
+        <div className="h-1.5 bg-gray-800 rounded-full overflow-hidden">
+          <div
+            className={`h-full rounded-full transition-all duration-300 ${
+              isUploading ? 'bg-purple-500' : phase === 'done' ? 'bg-green-500' : 'bg-gray-700'
+            }`}
+            style={{ width: `${Math.min(progress.uploadPct || 0, 100)}%` }}
+          />
+        </div>
+        {isUploading && progress.uploadPct > 0 && (
+          <p className="text-[10px] text-gray-600 mt-0.5 text-right">
+            {progress.uploadPct.toFixed(1)}%
+            {progress.uploadSpeed > 0 && progress.totalBytes > progress.uploadedBytes && (
+              <> · ETA {formatETA((progress.totalBytes - progress.uploadedBytes) / progress.uploadSpeed)}</>
+            )}
+          </p>
+        )}
+      </div>
     </div>
   )
 }
@@ -480,4 +622,19 @@ function formatBytes(b) {
   if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} KB`
   if (b < 1024 * 1024 * 1024) return `${(b / (1024 * 1024)).toFixed(1)} MB`
   return `${(b / (1024 * 1024 * 1024)).toFixed(2)} GB`
+}
+
+function formatSpeed(bytesPerSec) {
+  if (!bytesPerSec || bytesPerSec <= 0) return '0 B/s'
+  if (bytesPerSec < 1024) return `${bytesPerSec.toFixed(0)} B/s`
+  if (bytesPerSec < 1024 * 1024) return `${(bytesPerSec / 1024).toFixed(1)} KB/s`
+  if (bytesPerSec < 1024 * 1024 * 1024) return `${(bytesPerSec / (1024 * 1024)).toFixed(1)} MB/s`
+  return `${(bytesPerSec / (1024 * 1024 * 1024)).toFixed(2)} GB/s`
+}
+
+function formatETA(seconds) {
+  if (!seconds || seconds <= 0 || !isFinite(seconds)) return '--'
+  if (seconds < 60) return `${Math.ceil(seconds)}s`
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${Math.ceil(seconds % 60)}s`
+  return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`
 }
