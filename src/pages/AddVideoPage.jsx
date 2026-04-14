@@ -99,7 +99,7 @@ export default function AddVideoPage() {
       })
 
       // Async import with progress (202)
-      if (status === 202 && data.taskId) {
+      if ((status === 202 || data.taskId) && data.taskId) {
         const sseUrl = telegramAPI.getTransferProgress(data.taskId)
         const eventSource = new EventSource(sseUrl)
 

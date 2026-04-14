@@ -730,10 +730,14 @@ func pollTelegramUpdates(botToken string) {
 			chatTitle = "Direct Message"
 		}
 
-		// Check if already exists by file_unique_id
-		var existing int
-		db.QueryRow("SELECT COUNT(*) FROM telegram_files WHERE file_unique_id = ?", fileUniqueID).Scan(&existing)
-		if existing > 0 {
+		// Check if already exists by file_unique_id — update file_id if re-forwarded (local API uses different IDs)
+		var existingID string
+		err := db.QueryRow("SELECT id FROM telegram_files WHERE file_unique_id = ?", fileUniqueID).Scan(&existingID)
+		if err == nil {
+			// Update file_id in case it changed (e.g. switched from official to local API)
+			db.Exec("UPDATE telegram_files SET file_id = ?, status = 'pending' WHERE id = ?", fileID, existingID)
+			log.Printf("🔄 Updated file_id for: %s", fileName)
+			sendTelegramMessage(msg.Chat.ID, fmt.Sprintf("🔄 *%s* updated!\n📦 Size: %s\n\nReady to import.", fileName, formatBytes(fileSize)))
 			continue
 		}
 
