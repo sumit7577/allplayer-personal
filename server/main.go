@@ -74,8 +74,12 @@ type ImportTelegramFileRequest struct {
 // ---------- Database ----------
 
 func initDB() {
+	dbPath := os.Getenv("DB_PATH")
+	if dbPath == "" {
+		dbPath = "./allplayer.db"
+	}
 	var err error
-	db, err = sql.Open("sqlite3", "./allplayer.db?_journal_mode=WAL")
+	db, err = sql.Open("sqlite3", dbPath+"?_journal_mode=WAL")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -1004,10 +1008,10 @@ func main() {
 	r := gin.Default()
 
 	r.Use(cors.New(cors.Config{
-		AllowOrigins:     []string{"http://localhost:5173", "http://localhost:3000"},
+		AllowOrigins:     []string{"*"},
 		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		AllowHeaders:     []string{"Origin", "Content-Type", "Accept"},
-		AllowCredentials: true,
+		AllowCredentials: false,
 	}))
 
 	api := r.Group("/api")

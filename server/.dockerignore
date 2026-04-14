@@ -1,0 +1,6 @@
+allplayer-server
+allplayer.db
+allplayer.db-shm
+allplayer.db-wal
+.env
+.gitignore
